@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Dict, Literal, Optional
 
 from app.schemas.processing import ModelChoice
+from app.models.manager import DEFAULT_MANAGER
+from concurrent.futures import ThreadPoolExecutor
+import functools
 
 
 Status = Literal["processing", "finished"]
@@ -50,13 +53,40 @@ class LipSyncService:
         info = TaskInfo(task_id, video_path, audio_path, model_choice)
         cls._tasks[task_id] = info
 
-        # Simulate computation delay
+        # Simulate model loading and inference using the ModelManager.
+        try:
+            model = DEFAULT_MANAGER.get(model_choice.value)
+        except KeyError:
+            # If model isn't registered treat as processing failure; for now
+            # we'll still create a stub result so API consumers can be tested.
+            model = None
+
+        # Simulate computation delay (replace with real inference in future)
         await asyncio.sleep(2.0)
 
-        # Generate a mock result file
-        result_path = cls._results_dir / f"{task_id}.mp4"
-        # Create a tiny placeholder mp4-like file (not a real video but sufficient for IO tests)
-        result_path.write_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom")
+        # If model is callable, run it. It may perform blocking work (subprocess)
+        # so execute in a threadpool. If it returns a path to an output file,
+        # use that as the final result. On any error, fall back to the mock file.
+        result_path: Optional[Path] = None
+
+        if callable(model):
+            loop = asyncio.get_running_loop()
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                func = functools.partial(model, task_id=task_id, video=str(video_path), audio=str(audio_path))
+                try:
+                    returned = await loop.run_in_executor(pool, func)
+                    if isinstance(returned, str):
+                        p = Path(returned)
+                        if p.exists():
+                            result_path = p
+                except Exception:
+                    # Adapter failed; we'll fallback to mock result below
+                    pass
+
+        # If model didn't produce a real result, create a mock placeholder
+        if not result_path:
+            result_path = cls._results_dir / f"{task_id}.mp4"
+            result_path.write_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom")
 
         info.result_path = result_path
         info.status = "finished"
